@@ -21,4 +21,6 @@ public class SmartterCoperGolem implements ModInitializer {
 
 		LOGGER.info("Hello Fabric world!");
 	}
+
+	
 }
