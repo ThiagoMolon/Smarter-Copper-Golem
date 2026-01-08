@@ -1,0 +1,1 @@
+buildar e rodar no client: ./gradlew runClient

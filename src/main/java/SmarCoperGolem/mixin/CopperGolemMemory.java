@@ -58,9 +58,51 @@ public abstract class CopperGolemMemory implements CopperGolemMemoryAccess {
     }
 
     @Unique
+    private Object getItemGroupObject(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return null;
+        try {
+            Object item = stack.getItem();
+            if (item == null) return null;
+
+            try {
+                java.lang.reflect.Method mg = item.getClass().getMethod("getItemCategory");
+                mg.setAccessible(true);
+                Object grp = mg.invoke(item);
+                if (grp != null) return grp;
+            } catch (Throwable ignored) {}
+
+            try {
+                java.lang.reflect.Method mg = item.getClass().getMethod("getGroup");
+                mg.setAccessible(true);
+                Object grp = mg.invoke(item);
+                if (grp != null) return grp;
+            } catch (Throwable ignored) {}
+
+            return null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Unique
+    private boolean groupEquals(Object a, Object b) {
+        if (a == null || b == null) return false;
+        if (a.equals(b)) return true;
+        try {
+            String an = a.getClass().getSimpleName();
+            String bn = b.getClass().getSimpleName();
+            if (an != null && bn != null && an.equalsIgnoreCase(bn)) return true;
+            String as = a.toString();
+            String bs = b.toString();
+            if (as != null && bs != null && as.equalsIgnoreCase(bs)) return true;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    @Unique
     public Optional<BlockPos> smartChooseChestForItem(Level level, ItemStack held) {
         if (held == null || held.isEmpty()) return Optional.empty();
-        String heldCategory = getCategoryId(held);
+        Object heldGroup = getItemGroupObject(held);
 
         // First pass: category match with diversity check
         Iterator<BlockPos> it = smart_recentChests.iterator();
@@ -70,29 +112,48 @@ public abstract class CopperGolemMemory implements CopperGolemMemoryAccess {
             if (!(be instanceof ChestBlockEntity)) continue;
             ChestBlockEntity chest = (ChestBlockEntity) be;
 
+            try {
+                if (chest.getCustomName() != null) {
+                    String cname = chest.getCustomName().getString().trim();
+                    if (!cname.isEmpty()) {
+                        if (!chestNameAccepts(held, cname, level)) continue;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
             int size = chest.getContainerSize();
             int totalNonEmpty = 0;
-            int categoryMatches = 0;
-            Set<String> distinctBlocks = new HashSet<>();
+            int groupMatches = 0;
+            int sameItemCount = 0;
+            Set<String> distinctItemClasses = new HashSet<>();
 
             for (int i = 0; i < size; i++) {
                 ItemStack stack = chest.getItem(i);
                 if (stack == null || stack.isEmpty()) continue;
                 totalNonEmpty++;
-                String cat = getCategoryId(stack);
-                if (heldCategory != null && heldCategory.equals(cat)) categoryMatches++;
 
-                if (stack.getItem() instanceof BlockItem) {
-                    BlockItem bi = (BlockItem) stack.getItem();
-                    Block block = bi.getBlock();
-                    if (block != null) distinctBlocks.add(block.getClass().getName());
-                }
+                // exact same item class
+                if (stack.getItem().getClass().equals(held.getItem().getClass())) sameItemCount++;
+                distinctItemClasses.add(stack.getItem().getClass().getName());
+
+                Object g = getItemGroupObject(stack);
+                if (g != null && heldGroup != null && groupEquals(g, heldGroup)) groupMatches++;
             }
 
-            if (categoryMatches > 0) {
-                // if more than 3 different block types, skip even if category matches
-                if (distinctBlocks.size() > 3) continue;
-                return Optional.of(pos);
+            // If chest already contains the exact item, prefer it
+            if (sameItemCount > 0) return Optional.of(pos);
+
+            // If there are no items in the chest, it's acceptable
+            if (totalNonEmpty == 0) return Optional.of(pos);
+
+            // If majority of items match the held item's group, accept (avoid highly mixed chests)
+            if (groupMatches > 0) {
+                double ratio = (double) groupMatches / (double) totalNonEmpty;
+                if (ratio >= 0.7 || distinctItemClasses.size() <= 1) {
+                    return Optional.of(pos);
+                }
+                // otherwise skip this chest because it's too mixed
+                continue;
             }
         }
 
@@ -103,6 +164,15 @@ public abstract class CopperGolemMemory implements CopperGolemMemoryAccess {
             BlockEntity be = level.getBlockEntity(pos);
             if (!(be instanceof ChestBlockEntity)) continue;
             ChestBlockEntity chest = (ChestBlockEntity) be;
+
+            try {
+                if (chest.getCustomName() != null) {
+                    String cname = chest.getCustomName().getString().trim();
+                    if (!cname.isEmpty()) {
+                        if (!chestNameAccepts(held, cname, level)) continue;
+                    }
+                }
+            } catch (Throwable ignored) {}
 
             int size = chest.getContainerSize();
             int totalNonEmpty = 0;
@@ -154,6 +224,54 @@ public abstract class CopperGolemMemory implements CopperGolemMemoryAccess {
             return cls;
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    @Unique
+    private boolean chestNameAccepts(ItemStack held, String name, Level level) {
+        if (held == null || held.isEmpty()) return true;
+        try {
+            String raw = name.trim();
+            if (raw.isEmpty()) return true;
+
+            boolean isAllUpper = raw.equals(raw.toUpperCase());
+            boolean isAllLower = raw.equals(raw.toLowerCase());
+
+            String path = raw;
+            if (raw.contains(":")) {
+                String[] parts = raw.split(":", 2);
+                path = parts[1];
+            }
+            String pathLower = path.toLowerCase();
+
+            net.minecraft.resources.ResourceLocation id = net.minecraft.core.Registry.ITEM.getKey(held.getItem());
+            if (id == null) return false;
+            String itemPath = id.getPath();
+
+            if (isAllUpper) {
+                // match exato: "STONE" -> item.path == "stone"
+                if (raw.contains(":")) {
+                    return raw.equalsIgnoreCase(id.toString());
+                } else {
+                    return pathLower.equals(itemPath.toLowerCase());
+                }
+            } else if (isAllLower) {
+                // derivados (substring): "stone" aceita itens cujo id contém "stone"
+                if (itemPath.toLowerCase().contains(pathLower)) return true;
+                // também checar bloco se for BlockItem
+                try {
+                    if (held.getItem() instanceof BlockItem) {
+                        BlockItem bi = (BlockItem) held.getItem();
+                        net.minecraft.resources.ResourceLocation bid = net.minecraft.core.Registry.BLOCK.getKey(bi.getBlock());
+                        if (bid != null && bid.getPath().toLowerCase().contains(pathLower)) return true;
+                    }
+                } catch (Throwable ignored) {}
+                return false;
+            }
+            // mixed-case ou sem regra: não filtrar
+            return true;
+        } catch (Throwable t) {
+            return true;
         }
     }
 }
